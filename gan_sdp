@@ -1,0 +1,178 @@
+import math
+import numpy as np
+import torch.autograd
+import torch.nn as nn
+import scipy.io as scio
+from torch.autograd import Variable
+
+
+# 加载数据集并处理
+def data_processing(dataset="camel"):
+    print('Loading {} dataset...'.format(dataset))
+    data = scio.loadmat("D:\\NJUST\\SDP\\GAN-SDP\\datasets\\original_norm\\{}.mat".format(dataset))
+    x = data['X']
+    y = data['y']
+
+    defect_y = list(np.where(y.transpose() >= 1)[0])  # 从y中获取有缺陷的数据下标
+    defect_x = x[defect_y]  # 获取X中所有的缺陷数据
+
+    undefect_y = list(np.where(y.transpose() == 0)[0])  # 从y中获取无缺陷的数据下标
+    undefect_x = x[undefect_y]  # 获取X中所有的无缺陷数据
+
+    # 对样本少的一类数据进行生成
+    if len(defect_y) > len(undefect_y):
+        to_be_generated_x = undefect_x
+        to_be_generated_y = undefect_y
+    else:
+        to_be_generated_x = defect_x
+        to_be_generated_y = defect_y
+
+    generated_samples = torch.tensor(to_be_generated_x).float()
+    generated_labels = list('1' * len(to_be_generated_y))  # 获取有缺陷数据对应的标签（其实就是1，直接赋值）
+    num_to_add = math.floor(len(x) - len(to_be_generated_x) * 2)  # 需要生成的缺陷样本个数
+    attr_dim = np.shape(x)[1]  # 获取数据集的属性维度
+    # 返回数据：缺陷样本数据、缺陷样本标签、归一化的原始样本数据、处理过的原始样本标签、需要生成的样本个数、样本属性维度
+    return generated_samples, generated_labels, x, y, num_to_add, attr_dim
+
+
+# 通过LeakyReLU激活函数，接着进行一个线性变换，再经过一个LeakyReLU激活函数，
+# 然后经过线性变换将其变成样本的属性维度[此处是20]
+# 最后经过Sigmoid激活函数希望生成的假样本数据分布能够在0～1之间。
+class generator(nn.Module):
+    def __init__(self, z_dim, num_dim):
+        super(generator, self).__init__()
+        self.gen = nn.Sequential(
+            nn.Linear(z_dim, 256),  # 用线性变换将输入映射到256维
+            nn.ReLU(True),  # Relu激活
+            nn.Linear(256, 256),  # 线性变换
+            nn.ReLU(True),  # Relu激活
+            nn.Linear(256, num_dim),  # 线性变换
+            nn.Sigmoid()  # Sigmoid激活使得生成数据分布在[0,1]之间
+        )
+
+    def forward(self, x):
+        x = self.gen(x)
+        return x
+
+
+# 根据样本的属性维度，通过多层感知器，中间经过斜率设置为0.2的LeakyReLU激活函数，
+# 最后接sigmoid激活函数得到一个0到1之间的概率进行二分类。
+class discriminator(nn.Module):
+    def __init__(self, num_dim):
+        super(discriminator, self).__init__()
+        self.dis = nn.Sequential(
+            nn.Linear(num_dim, 256),  # 输入特征数为样本的属性维度(此处为20)，输出为256
+            nn.LeakyReLU(0.2),  # 进行非线性映射
+            nn.Linear(256, 256),  # 进行一个线性映射
+            nn.LeakyReLU(0.2),
+            nn.Linear(256, 1),
+            nn.Sigmoid()  # 也是一个激活函数，二分类问题中sigmoid()可以将实数映射到[0,1]作为概率值，多分类用softmax()函数
+        )
+
+    def forward(self, x):
+        x = self.dis(x)
+        return x
+
+
+# =================================判别器训练train===================================
+'''
+分为两部分：
+1、真的图像判别为真；
+2、假的图像判别为假。此过程中，生成器参数不断更新
+'''
+if __name__ == '__main__':
+    datasets = ["ant", "AR1", "AR3", "AR4", "AR5", "AR6", "arc", "camel", "CM1", "EQ", "ivy", "JDT", "jedit", "log4j",
+                "ML", "MW1", "PC1", "PC3", "PC4", "PDE", "redaktor", "Safe", "synapse", "xalan", "xerces", "Zxing"]
+    # datasets = ["ivy"]
+    num_epoch = 1000  # 每个轮次迭代的次数
+    z_dimension = 32  # 噪音维度
+    for ds_name in datasets:
+        # 读取数据集
+        samples, labels, new_samples, new_labels, number_of_generate, number_of_attr = data_processing(ds_name)
+
+        # 创建对象
+        D = discriminator(number_of_attr)
+        G = generator(z_dimension, number_of_attr)
+
+        # 首先需要定义loss的度量方式（二分类的交叉熵），其次定义优化函数,优化函数的学习率为0.0003
+        criterion = nn.BCELoss()  # 是单目标二分类交叉熵函数
+        d_optimizer = torch.optim.Adam(D.parameters(), lr=0.0003)
+        g_optimizer = torch.optim.Adam(G.parameters(), lr=0.0003)
+
+        # data loader 数据载入(批次读取)
+        dataloader = torch.utils.data.DataLoader(dataset=samples, batch_size=4, shuffle=True)
+
+        # 由于每个轮次生成的样本有限，所以需要进行多次生成操作
+        rounds = math.ceil(number_of_generate / len(samples))  # 向上取整保证待生成的数据不够一轮生成也可以进行
+        # 进行迭代生成
+        for rd in range(rounds):
+            print('===============================第{}轮,共{}轮==============================='.format(rd + 1, rounds))
+            for epoch in range(num_epoch):  # 进行多个epoch的训练
+                for i, sample in enumerate(dataloader):
+                    num_sample = sample.size(0)
+                    # =============================训练判别器==================
+                    sample = sample.view(num_sample, -1)  # view()是将一个多行的Tensor拼接成一行
+                    real_sample = Variable(sample)  # 将tensor变成Variable放入计算图中
+                    real_label = Variable(torch.ones(num_sample))  # 定义真实的图片label为1
+                    fake_label = Variable(torch.zeros(num_sample))  # 定义假的图片的label为0
+
+                    # 计算真实样本的损失
+                    real_out = D(real_sample)  # 将真实图片放入判别器中
+                    d_loss_real = criterion(real_out, real_label)  # 得到真实图片的loss
+                    real_scores = real_out  # 得到真实图片的判别值，输出的值越接近1越好
+
+                    # 计算假样本的损失
+                    z = Variable(torch.randn(num_sample, z_dimension))  # 随机生成一些噪声
+                    fake_sample = G(z)  # 随机噪声放入生成网络中，生成一个假的样本
+                    fake_out = D(fake_sample)  # 判别器判断假的样本
+                    d_loss_fake = criterion(fake_out, fake_label)  # 得到假的样本的loss
+                    fake_scores = fake_out  # 得到假样本的判别值，对于判别器来说，假样本的损失越接近0越好
+
+                    # 损失函数和优化
+                    d_loss = d_loss_real + d_loss_fake  # 损失包括判真损失和判假损失
+                    d_optimizer.zero_grad()  # 在反向传播之前，先将梯度归0
+                    d_loss.backward()  # 将误差反向传播
+                    d_optimizer.step()  # 更新参数
+
+                    # ========================训练生成器============================
+                    # ========================生成网络的训练========================
+                    # 原理：目的是希望生成的假的样本被判别器判断为真的样本，在此过程中，将判别器固定，
+                    # 将假的样本传入判别器的结果与真实的label对应，反向传播更新的参数是生成网络里面的参数，
+                    # 这样可以通过更新生成网络里面的参数来训练网络，使得生成的样本让判别器以为是真的，这样就达到对抗目的
+
+                    # 计算假样本的损失
+                    z = Variable(torch.randn(num_sample, z_dimension))  # 得到随机噪声
+                    fake_sample = G(z)  # 随机噪声输入到生成器中，得到一个假的样本
+                    output = D(fake_sample)  # 经过判别器得到的结果
+                    g_loss = criterion(output, real_label)  # 得到的假样本与真实样本label的loss
+
+                    # bp and optimize
+                    g_optimizer.zero_grad()  # 梯度归0
+                    g_loss.backward()  # 进行反向传播
+                    g_optimizer.step()  # .step()一般用在反向传播后面,用于更新生成网络的参数
+
+                    # 打印中间的损失
+                    if (i + 1) % 1000 == 1:
+                        print('Epoch[{}/{}],d_loss:{:.5f},g_loss:{:.5f} ''D_real: {:.5f},D_fake: {:.5f}'.format(
+                            epoch + 1, num_epoch, d_loss.item(), g_loss.item(), real_scores.data.mean(),
+                            fake_scores.data.mean()))
+
+                    if epoch == (num_epoch - 1):
+                        # if rd == rounds - 1 and (rd + 1) * num_sample > number_of_generate:
+                        #     num_of_remain = number_of_generate - (rd * num_sample)  # 最后一轮待生成的样本个数要单独处理
+                        #     new_fake_sample = fake_sample.detach().numpy()
+                        #     np.random.shuffle(new_fake_sample)  # 打乱数据
+                        #     new_fake_sample = new_fake_sample[:num_of_remain]
+                        #     new_output = torch.ones(1, num_of_remain).detach().numpy()
+                        # else:
+                        #     new_fake_sample = fake_sample.detach().numpy()[:]
+                        #     new_output = torch.ones(1, num_sample).detach().numpy()
+
+                        new_fake_sample = fake_sample.detach().numpy()[:]
+                        new_output = torch.ones(1, num_sample).detach().numpy()
+                        new_samples = np.vstack((new_samples, new_fake_sample))
+                        new_labels = np.hstack((new_labels, new_output))
+
+            if rd == rounds - 1:  # 将归一化后的数据和由gan网络生成的新样本一起保存
+                scio.savemat("D:\\NJUST\\SDP\\GAN-SDP\\datasets\\gan-batchsize4\\{}.mat".format(ds_name),
+                             {'X': new_samples, 'y': new_labels})
